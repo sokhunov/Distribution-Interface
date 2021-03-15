@@ -5,7 +5,12 @@ from sqlalchemy import Column, Integer, String, Date, DateTime, Float, Boolean
 from sqlalchemy.ext.hybrid import hybrid_method
 from sqlalchemy.sql.expression import func
 import datetime
-from connectors.connection import  load_session, create_rarus_connection
+from connectors.connection import load_session, create_rarus_connection
+import logging
+
+logging.basicConfig(filename=f"./logs/log_{datetime.date.today().strftime('%d-%m-%Y')}",
+                    format='%(filename)s: %(message)s', level=logging.DEBUG)
+
 
 Base = automap_base()
 
@@ -60,17 +65,19 @@ class DistributionGoods(Base):
         print(f'Done! Added {added_skus} skus.')
 
     @hybrid_method
-    def _convert_to_rarus_format(cls, codes):
+    def convert_to_rarus_format(cls, codes):
         """
         Конвертация списка кодов ["code1", "code2", "code3" ..] в вид -> "code1", "code2", "code3" ..
         """
+        logging.info(f'Converting to rarus format: {codes}')
         return ','.join([f'"{code}"' for code in codes])
 
     @hybrid_method
-    def _convert_codes_to_rarus_format(cls, codes: list) -> str:
+    def convert_codes_to_rarus_format(cls, codes: list) -> str:
         """
         Конвертация [("code1"), ("code2"), ("code3")..]  в вид -> "code1", "code2", "code3" ...
         """
+        logging.info(f'Converting codes: {codes} to rarus format')
         return ','.join([f'"{code[0]}"' for code in codes])
 
     @hybrid_method
@@ -82,9 +89,9 @@ class DistributionGoods(Base):
         :param codes: 1С код(а) товаров, которые будут исключены из результата запроса
         :return df {DataFrame}: Данные по 1С коду товара, названию товара,  названиям поставщика из 1С и Бренду
         """
-        r_supplier_codes = cls._convert_to_rarus_format(cls.DISTRIBUTION_SUPPLIERS_BRANDS.keys())
-        r_codes = cls._convert_codes_to_rarus_format(codes)
-        rarus_connector = create_rarus_connection()
+        logging.info('Getting brands skus from rarus')
+        r_supplier_codes = cls.convert_to_rarus_format(cls.DISTRIBUTION_SUPPLIERS_BRANDS.keys())
+        r_codes = cls.convert_codes_to_rarus_format(codes)
 
         qry_suppl_skus = f"""
             ВЫБРАТЬ
@@ -118,21 +125,24 @@ class DistributionGoods(Base):
                 СогласованиеЦенСрезПоследних.Контрагент.Наименование
             """
 
+        logging.info('Getting rarus connector')
         rarus_connector = create_rarus_connection()
+        logging.info('Getting data from RARUS')
         query = rarus_connector.NewObject("Query", qry_suppl_skus)
         sel = query.Execute().Choose()  # Get result of RARUS query
 
         del rarus_connector
 
         data = []
-
         while sel.next():
             data.append((sel.Code, sel.Name, sel.Supplier, cls.DISTRIBUTION_SUPPLIERS_BRANDS.get(sel.SupplierCode)))
 
         # ! Важно не менять название колонок, т.к по ним в дальнейшем будет выгрузка данных в БД.
         # Данне названия - это названия соотвествующих столбцов в таблице DistributionGoods в БД
+        logging.info('Converting RARUS data to pd.Dataframe')
         df = pd.DataFrame(data, columns=['code', 'name', 'supplier_name', 'brand']).set_index('code')
         df['log_date'] = datetime.datetime.now()
+        logging.info('Finished. Returning rarus brands skus')
         return df
 
     @hybrid_method
@@ -141,28 +151,35 @@ class DistributionGoods(Base):
         Запрос получает все 1С кода товаров, которые есть в БД.
         Все кода возращенные из запроса, не будут включаться в дальнейший запрос из 1С get_brands_rarus_skus.
         Поэтому важно возвращать любой 1С код как резульат запроса, если не возвратить, то запрос get_brands_rarus_skus
-        "поламается"
+        "поломается"
         """
+        logging.info('Getting goods code from db..')
+        logging.info('loading session..')
         db_session = load_session()
+        logging.info('getting codes from db..')
         result = db_session.query(DistributionGoods.code).all()
         db_session.close()
         if not result:
+            logging.warning('goods table is empty. Setting default code..')
             return [("00000001")]  # Предоплата код
 
+        logging.info('return codes from goods table ..')
         return result
 
     @hybrid_method
     def _add_goods_to_db(cls, df):
         """
-        Сохранение данных в таблицу Бд.
+        Сохранение данных в таблицу БД.
         :param df: Данные по товарам поставщиков дистрибуции и брендам
-        :return:
+        :return: Number of added goods to DB table
         """
+        logging.info('Adding goods to db table')
         db_session = load_session()
         df.to_sql(cls.__tablename__, db_session.connection(), if_exists='append')
         db_session.commit()
         db_session.close()
 
+        logging.info(f'Finished. Added {len(df)} goods')
         return len(df)
 
 
@@ -206,9 +223,7 @@ class DistributionSales(Base):
     def __call__(self):
         if not self.append:
             self._get_dates_from_user()
-            print('Dates is set.')
             self._delete_from_db_table()
-            print(f'Data for the period {self.start_date} - {self.end_date} deleted from the table')
         else:
             max_date_from_db = self._get_max_sales_date_()
             if not max_date_from_db:
@@ -232,6 +247,7 @@ class DistributionSales(Base):
         Затем идет проверка на корректность пользовательских дат
         :return:
         """
+        logging.info('Getting dates from the user')
         start_date = input('Please input start date in YYYY-MM-DD format: ')
         end_date = input('Please input end date in YYYY-MM-DD format: ')
         self._validate_dates_(start_date, end_date)  # Проверка корректности дат
@@ -248,17 +264,26 @@ class DistributionSales(Base):
         :param end_date: Дата конца анализа
         :return:
         """
-        assert len(start_date) == 10 and '-' in start_date, 'Wrong start date. Input date in YYYY-MM-DD format.'
-        assert len(end_date) == 10 and '-' in end_date, 'Wrong end date. Input date in YYYY-MM-DD format.'
+        logging.info('Validating user dates')
+        try:
+            assert len(start_date) == 10 and '-' in start_date, 'Wrong start date. Input date in YYYY-MM-DD format.'
+            assert len(end_date) == 10 and '-' in end_date, 'Wrong end date. Input date in YYYY-MM-DD format.'
+        except AssertionError as err:
+            logging.error(err)
+            raise err
 
         for date_ in [start_date, end_date]:
             year, month, day = date_.strip().split('-')
-            assert len(year) == 4 and int(
-                year) >= 2016, f'Wrong year format in {date_}. Year should be 4 digits (YYYY) and >= 2016'
-            assert len(month) == 2 and int(month) in range(1,
-                                                           12), f'Wrong month format in {date_}. Month should be 2 digits (MM) and in range 1-12'
-            assert len(day) == 2 and int(day) in range(1,
-                                                       31), f'Wrong month format in {date_}. Day should be 2 digits (DD) and in range 1-31'
+            try:
+                assert len(year) == 4 and int(
+                    year) >= 2016, f'Wrong year format in {date_}. Year should be 4 digits (YYYY) and >= 2016'
+                assert len(month) == 2 and int(month) in \
+                       range(1, 12), f'Wrong month format in {date_}. Month should be 2 digits (MM) and in range 1-12'
+                assert len(day) == 2 and int(day) in \
+                       range(1, 31), f'Wrong month format in {date_}. Day should be 2 digits (DD) and in range 1-31'
+            except AssertionError as err:
+                logging.error(err)
+                raise err
 
     @hybrid_method
     def _delete_from_db_table(self):
@@ -266,11 +291,13 @@ class DistributionSales(Base):
         Удаление данных о продажах за периода анализа из БД
         :return:
         """
+        logging.info(f'Delete sales data for the period {self.start_date} - {self.end_date}')
         db_session = load_session()
         db_session.query(DistributionSales).filter(
             DistributionSales.date_.between(self.start_date, self.end_date)).delete(synchronize_session=False)
         db_session.commit()
         db_session.close()
+        logging.info('Deleted sales data')
 
     @hybrid_method
     def _get_max_sales_date_(cls):
@@ -278,17 +305,25 @@ class DistributionSales(Base):
         Получить максимальную дату продаж из БД таблицы
         :return max_date: Самая последняя дата в БД таблице
         """
+        logging.info('Getting last date from sales table')
         db_session = load_session()
         max_date = db_session.query(func.max(DistributionSales.date_)).scalar()
         db_session.close()
 
+        logging.info(f'Max sales date in the sales table {max_date}')
         return max_date
 
     @hybrid_method
-    def _check_sales_for_period_(self):
+    def _check_sales_data_(self):
+        """
+        Проверим есть ли вообще данные в таблице продаж
+        :return bool: True если есть иначе False
+        """
+        logging.info('Checking if table contains any sales data ')
         db_session = load_session()
         data = db_session.query(DistributionSales.id).scalar()
 
+        logging.info(f'Finished. Result: {bool(data)}')
         return bool(data)
 
     @hybrid_method
@@ -301,6 +336,7 @@ class DistributionSales(Base):
 
         :return df {DataFrame}: данные по продажам за периоджд
         """
+        logging.info(f'Getting sales from RARUS for the period {self.start_date} - {self.end_date}')
         da1 = self.start_date.strftime('%Y, %m, %d')
         date_begin = f'ДАТАВРЕМЯ({da1}, 00, 00, 01)'
         da2 = self.end_date.strftime('%Y, %m, %d')
@@ -308,9 +344,13 @@ class DistributionSales(Base):
 
         sku_codes = DistributionGoods._get_goods_codes_from_db_()
 
-        assert len(sku_codes) > 1, 'DistribtuionGoods table is empty ..'
+        try:
+            assert len(sku_codes) > 1, 'DistribtuionGoods table is empty ..'
+        except AssertionError as err:
+            logging.error(err)
+            raise err
 
-        r_codes = DistributionGoods._convert_codes_to_rarus_format(sku_codes)
+        r_codes = DistributionGoods.convert_codes_to_rarus_format(sku_codes)
 
         qry_sales = f"""
         ВЫБРАТЬ
@@ -355,8 +395,10 @@ class DistributionSales(Base):
             Date_
         """
 
+        logging.info('Creating connection to RARUS')
         rarus_connector = create_rarus_connection()
 
+        logging.info('Quering data from RARUS')
         query = rarus_connector.NewObject("Query", qry_sales)
         sel = query.Execute().Choose()  # Get result of RARUS query
 
@@ -366,6 +408,7 @@ class DistributionSales(Base):
             data.append((sel.Shop, sel.Date_.date(), sel.Code, sel.Name, sel.Qty, sel.Turnover, sel.Turnover_wo_vat,
                          sel.COGS, sel.Margin, sel.Margin_percent, sel.CustomerCode, sel.Customer))
 
+        logging.info('Formating RARUS sales to pd.Dataframe')
         df = pd.DataFrame(data,
                           columns=['branch', 'date_', 'code', 'name', 'quantity_sold', 'turnover', 'turnover_wo_vat',
                                    'cogs', 'margin', 'margin_percent', 'client_code', 'client'])
@@ -399,17 +442,26 @@ class DistributionSales(Base):
 
     @hybrid_method
     def _set_customers_(self, df):
+        """
+        Установим правильных покупателей
+        :param df -> pd.Dataframe: Данные по продажам
+        :return:
+        """
+        logging.info('Setting customers..')
         df['client'] = df.apply(lambda x: self._get_customer_(x), axis=1)
         df.drop('client_code', axis=1, inplace=True)
 
+        logging.info('Finished!')
         return df
 
     @hybrid_method
     def save_to_db(self, df):
+        logging.info('Saving data to database..')
         db_session = load_session()
         df.to_sql(self.__tablename__, db_session.connection(), if_exists='append')
         db_session.commit()
         db_session.close()
+        logging.info('Finished!')
 
 
 Base.prepare()
