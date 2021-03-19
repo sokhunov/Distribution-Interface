@@ -1,35 +1,29 @@
-from sqlalchemy.ext.automap import automap_base
-from sqlalchemy.orm import column_property
 import pandas as pd
-from sqlalchemy import Column, Integer, String, Date, DateTime, Float, Boolean
-from sqlalchemy.ext.hybrid import hybrid_method
-from sqlalchemy.sql.expression import func
 import datetime
-from connectors.connection import load_session, create_rarus_connection
+from connectors.connection import create_rarus_connection, create_sql02_connection
 import logging
 
 logging.basicConfig(filename=f"./logs/log_{datetime.date.today().strftime('%d-%m-%Y')}",
-                    format='%(filename)s: %(message)s', level=logging.DEBUG)
+                    format='%(asctime)s: %(message)s', level=logging.DEBUG)
 
 
-Base = automap_base()
-
-
-class DistributionGoods(Base):
+class DistributionGoods:
     """
 
     Товары поставщиков дистрибуции.
     Сами товары изначально заносятся в 1С. По согласованным ценам можно получить товары и поставщиков.
-    Данный запрос получает товары из 1С и дополняет их в БД таблицу DistributionGoods.
+    Данный класс получает товары из 1С и дополняет их в БД таблицу DistributionGoods.
 
-    ! DISTRIBTUION_SUPPLIER_BRANDS - хранит информаию 1С кодах поставщика и бренда поставщика. Важно, при появлении новых
-    поставщиков дополнять список, иначе товары не попадут в запрос из 1С.
+    ! DISTRIBTUION_SUPPLIER_BRANDS - хранит информаию 1С кодах поставщика и бренда поставщика. Важно, при появлении
+    новых поставщиков дополнять список, иначе товары новых поставщиков не попадут в запрос из 1С.
 
     1. В целях оптимизации запроса из 1С, сначала получим уже существующие 1С кода товаров из БД таблица DistributionGoods
-    2. Получим товары, которые принадлежат поставщикам дистрибуции из DISTRIBUTION_SUPPLIERS_BRANDS из 1С
+    2. Получим товары, которые принадлежат поставщикам дистрибуции из DISTRIBUTION_SUPPLIERS_BRANDS из 1С и исключим
+    товары полученные из шага 1.
     3. Запишем результат в БД.
 
     """
+    DB_TABLE_NAME = 'ANALITYCS.dbo.DistributionGoods'
     # Список поставщиков дистрибуции и их бренды
     DISTRIBUTION_SUPPLIERS_BRANDS = {
         'DR002218': 'ROZMETOV',
@@ -42,56 +36,79 @@ class DistributionGoods(Base):
         'DR002220': 'ULTRAFISH',
         'DR001488': 'POLAR',
         'DR001643': 'POLAR',
-        'DR002292': 'CHERKIZOVO'
+        'DR002292': 'CHERKIZOVO',
+        'DR002219': 'SVITLOGORIE'
     }
 
-    __tablename__ = 'DistributionGoods'
-
-    __table_args__ = {'extend_existing': True}
-
-    code = Column(String, primary_key=True)  # код 1С товара
-    name = Column(String)  # название товара
-    supplier_name = Column(Boolean)
-    brand = Column(String)  # название бренда
-    log_date = Column(DateTime, default=datetime.datetime.now, onupdate=datetime.datetime.now)
-
     def __call__(self):
-        codes = self._get_goods_codes_from_db_()
         added_skus = 0
-        res = self.get_brands_rarus_skus(codes)
+        res = self.get_brands_skus_from_rarus()
         if not res.empty:
             added_skus = self._add_goods_to_db(res)
 
-        print(f'Done! Added {added_skus} skus.')
+        logging.info('**** ADDED SKUS: ', added_skus)
 
-    @hybrid_method
-    def convert_to_rarus_format(cls, codes):
+    @staticmethod
+    def convert_to_string(codes) -> str:
         """
         Конвертация списка кодов ["code1", "code2", "code3" ..] в вид -> "code1", "code2", "code3" ..
         """
-        logging.info(f'Converting to rarus format: {codes}')
+        logging.info(f'Converting list of codes to rarus format..')
         return ','.join([f'"{code}"' for code in codes])
 
-    @hybrid_method
-    def convert_codes_to_rarus_format(cls, codes: list) -> str:
+    @staticmethod
+    def convert_db_codes_to_string(codes: list) -> str:
         """
-        Конвертация [("code1"), ("code2"), ("code3")..]  в вид -> "code1", "code2", "code3" ...
+        Конвертация [("code1", ), ("code2", ), ("code3", )..]  в вид -> "code1", "code2", "code3" ...
         """
-        logging.info(f'Converting codes: {codes} to rarus format')
+        logging.info(f'Converting list of db codes to rarus format')
         return ','.join([f'"{code[0]}"' for code in codes])
 
-    @hybrid_method
-    def get_brands_rarus_skus(cls, codes):
+    @classmethod
+    def get_goods_codes_from_db(cls):
+        """
+        Запрос получает все 1С кода товаров, которые есть в БД.
+        Все кода возращенные из запроса, не будут включаться в дальнейший запрос из 1С get_brands_rarus_skus.
+        Поэтому важно возвращать любой 1С код как резульат запроса, если не возвратить, то запрос get_brands_rarus_skus
+        "поломается"
+
+        :return result -> [()]: Return list of tuples
+        """
+        logging.info('Getting goods code from db..')
+        logging.info('loading session..')
+        db_session = create_sql02_connection()
+        logging.info('Executing query..')
+        result = db_session.execute(f"Select code from {cls.DB_TABLE_NAME}").fetchall()
+        db_session.close()
+
+        return result
+
+    @classmethod
+    def get_db_goods_codes_in_rarus_format(cls) -> str:
+        """
+        Функция возвращает коды товаров в понятный для фильтра формат.
+        Данный формат понятен для РАРУС-а и для sql
+        :return string of codes: "code1", "code2" .. "codeN"
+        """
+        codes_str = ''
+        db_goods_codes = cls.get_goods_codes_from_db()
+        if db_goods_codes:
+            codes_str = cls.convert_db_codes_to_string(db_goods_codes)
+
+        return codes_str
+
+    def get_brands_skus_from_rarus(self):
         """
         Получим из 1С товары, которые принадлежат постащвикам дистрибуции, но которых еще нет в БД.
-        По SupplierCode-у из запроса, мы получим его бренд из DISTRIBTUION_SUPPLIERS_BRANDS
-
-        :param codes: 1С код(а) товаров, которые будут исключены из результата запроса
+        Установим бренд из DISTRIBUTION_SUPPLIERS_BRANDS по SupplierCode-у из результата запроса
         :return df {DataFrame}: Данные по 1С коду товара, названию товара,  названиям поставщика из 1С и Бренду
         """
-        logging.info('Getting brands skus from rarus')
-        r_supplier_codes = cls.convert_to_rarus_format(cls.DISTRIBUTION_SUPPLIERS_BRANDS.keys())
-        r_codes = cls.convert_codes_to_rarus_format(codes)
+        logging.info('Getting brands suppliers codes')
+        r_supplier_codes = self.convert_to_string(self.DISTRIBUTION_SUPPLIERS_BRANDS.keys())
+        r_codes = self.get_db_goods_codes_in_rarus_format()
+        if not r_codes:
+            logging.warning('Exclude codes is empty. Get all brands SKUs')
+            r_codes = "00000001"  # Предоплата код
 
         qry_suppl_skus = f"""
             ВЫБРАТЬ
@@ -135,38 +152,17 @@ class DistributionGoods(Base):
 
         data = []
         while sel.next():
-            data.append((sel.Code, sel.Name, sel.Supplier, cls.DISTRIBUTION_SUPPLIERS_BRANDS.get(sel.SupplierCode)))
+            data.append((sel.Code, sel.Name, sel.Supplier, self.DISTRIBUTION_SUPPLIERS_BRANDS.get(sel.SupplierCode)))
 
         # ! Важно не менять название колонок, т.к по ним в дальнейшем будет выгрузка данных в БД.
-        # Данне названия - это названия соотвествующих столбцов в таблице DistributionGoods в БД
+        # Данные названия - это названия соотвествующих столбцов в таблице DistributionGoods в БД
         logging.info('Converting RARUS data to pd.Dataframe')
         df = pd.DataFrame(data, columns=['code', 'name', 'supplier_name', 'brand']).set_index('code')
         df['log_date'] = datetime.datetime.now()
         logging.info('Finished. Returning rarus brands skus')
         return df
 
-    @hybrid_method
-    def _get_goods_codes_from_db_(cls):
-        """
-        Запрос получает все 1С кода товаров, которые есть в БД.
-        Все кода возращенные из запроса, не будут включаться в дальнейший запрос из 1С get_brands_rarus_skus.
-        Поэтому важно возвращать любой 1С код как резульат запроса, если не возвратить, то запрос get_brands_rarus_skus
-        "поломается"
-        """
-        logging.info('Getting goods code from db..')
-        logging.info('loading session..')
-        db_session = load_session()
-        logging.info('getting codes from db..')
-        result = db_session.query(DistributionGoods.code).all()
-        db_session.close()
-        if not result:
-            logging.warning('goods table is empty. Setting default code..')
-            return [("00000001")]  # Предоплата код
-
-        logging.info('return codes from goods table ..')
-        return result
-
-    @hybrid_method
+    @classmethod
     def _add_goods_to_db(cls, df):
         """
         Сохранение данных в таблицу БД.
@@ -174,8 +170,8 @@ class DistributionGoods(Base):
         :return: Number of added goods to DB table
         """
         logging.info('Adding goods to db table')
-        db_session = load_session()
-        df.to_sql(cls.__tablename__, db_session.connection(), if_exists='append')
+        db_session = create_sql02_connection()
+        df.to_sql(cls.DB_TABLE_NAME, db_session.cursor(), if_exists='append')
         db_session.commit()
         db_session.close()
 
@@ -183,34 +179,19 @@ class DistributionGoods(Base):
         return len(df)
 
 
-class DistributionSales(Base):
-    __tablename__ = 'DistributionSales'
-
-    __table_args__ = {'extend_existing': True}
-
-    id_ = column_property(Column('id', Integer, primary_key=True, autoincrement=True))
-    date_ = Column(Date)   # дата продаж
-    branch = Column(String)  # подраздление компании
-    code = Column(String)  # код товара 1С
-    name = Column(String)  # название товара
-    quantity_sold = Column(Float)
-    turnover = Column(Float)
-    turnover_wo_vat = Column(Float)
-    cogs = Column(Float)  # себестоимость товара
-    margin = Column(Float)
-    margin_percent = Column(Float)
-    client = Column(String)  # название покупателя
+class DistributionSales:
+    DB_TABLE_NAME = 'Analitycs.dbo.DistributionSales'
 
     def __init__(self, append=True):
         """
-        Если append == True, тогда
+        Если append == False, тогда
             1. У Пользователя запращивается периода анализа.
             2. Данные по данному периоду удаляется из БД
             3. Получаются данные по продажам из 1С по данному периоду
             4. Сохранение в БД данных о продажах
-        Если append == False, тогда
+        Если append == True, тогда
             1. Дата начала анализа получаеми максимальную дату БД таблицы.
-            2. Если даты, нет то пеориод анализа запращиваются у пользователя
+            2. Если даты нет, то пеориод анализа запращиваются у пользователя
             2.1 Если дата есть, то дата начала анализа = максимальная дата + 1 день,
                 дата конца анализа = текущая дата - 2 дня
             3. Получаются данные по продажам из 1С по данному периоду
@@ -240,7 +221,6 @@ class DistributionSales(Base):
         self.save_to_db(df)
         print('Done!..')
 
-    @hybrid_method
     def _get_dates_from_user(self):
         """
         У пользователя запращиваются дата начала анализа и дата конца анализа
@@ -250,83 +230,55 @@ class DistributionSales(Base):
         logging.info('Getting dates from the user')
         start_date = input('Please input start date in YYYY-MM-DD format: ')
         end_date = input('Please input end date in YYYY-MM-DD format: ')
-        self._validate_dates_(start_date, end_date)  # Проверка корректности дат
+        assert len(start_date) == 10 and '-' in start_date, 'Wrong start date. Input date in YYYY-MM-DD format.'
+        assert len(end_date) == 10 and '-' in end_date, 'Wrong end date. Input date in YYYY-MM-DD format.'
 
-        self.start_date = datetime.datetime.strptime(start_date, '%Y-%m-%d').date()
-        self.end_date = datetime.datetime.strptime(end_date, '%Y-%m-%d').date()
-        assert self.start_date < self.end_date, f'User {self.start_date} < {self.end_date}'
-
-    @hybrid_method
-    def _validate_dates_(self, start_date, end_date):
-        """
-        Проверка корректности введенных дат.
-        :param start_date: Дата начала анализа
-        :param end_date: Дата конца анализа
-        :return:
-        """
-        logging.info('Validating user dates')
         try:
-            assert len(start_date) == 10 and '-' in start_date, 'Wrong start date. Input date in YYYY-MM-DD format.'
-            assert len(end_date) == 10 and '-' in end_date, 'Wrong end date. Input date in YYYY-MM-DD format.'
-        except AssertionError as err:
+            self.start_date = datetime.datetime.strptime(start_date, '%Y-%m-%d').date()
+            self.end_date = datetime.datetime.strptime(end_date, '%Y-%m-%d').date()
+        except Exception as err:
             logging.error(err)
             raise err
 
-        for date_ in [start_date, end_date]:
-            year, month, day = date_.strip().split('-')
-            try:
-                assert len(year) == 4 and int(
-                    year) >= 2016, f'Wrong year format in {date_}. Year should be 4 digits (YYYY) and >= 2016'
-                assert len(month) == 2 and int(month) in \
-                       range(1, 12), f'Wrong month format in {date_}. Month should be 2 digits (MM) and in range 1-12'
-                assert len(day) == 2 and int(day) in \
-                       range(1, 31), f'Wrong month format in {date_}. Day should be 2 digits (DD) and in range 1-31'
-            except AssertionError as err:
-                logging.error(err)
-                raise err
-
-    @hybrid_method
     def _delete_from_db_table(self):
         """
         Удаление данных о продажах за периода анализа из БД
         :return:
         """
         logging.info(f'Delete sales data for the period {self.start_date} - {self.end_date}')
-        db_session = load_session()
-        db_session.query(DistributionSales).filter(
-            DistributionSales.date_.between(self.start_date, self.end_date)).delete(synchronize_session=False)
+        db_session = create_sql02_connection()
+        qry = f"Delete from {self.DB_TABLE_NAME} where date_ between '{self.start_date}' and '{self.end_date}'"
+        db_session.execute(qry)
         db_session.commit()
         db_session.close()
-        logging.info('Deleted sales data')
+        logging.info('Finished!')
 
-    @hybrid_method
-    def _get_max_sales_date_(cls):
+    def _get_max_sales_date_(self):
         """
         Получить максимальную дату продаж из БД таблицы
         :return max_date: Самая последняя дата в БД таблице
         """
         logging.info('Getting last date from sales table')
-        db_session = load_session()
-        max_date = db_session.query(func.max(DistributionSales.date_)).scalar()
+        db_session = create_sql02_connection()
+        res = db_session.execute(f"select max(date_) from {self.DB_TABLE_NAME}").fetchone()
         db_session.close()
 
-        logging.info(f'Max sales date in the sales table {max_date}')
-        return max_date
+        logging.info(f'Max sales date in the sales table {res}')
+        return res
 
-    @hybrid_method
     def _check_sales_data_(self):
         """
         Проверим есть ли вообще данные в таблице продаж
         :return bool: True если есть иначе False
         """
         logging.info('Checking if table contains any sales data ')
-        db_session = load_session()
-        data = db_session.query(DistributionSales.id).scalar()
+        db_session = create_sql02_connection()
+        res = db_session.execute(f"select max(id) from {self.DB_TABLE_NAME}").fetchone()
+        db_session.close()
 
-        logging.info(f'Finished. Result: {bool(data)}')
-        return bool(data)
+        logging.info(f'Finished. Result: {bool(res)}')
+        return bool(res)
 
-    @hybrid_method
     def _get_sales_(self):
         """
 
@@ -342,15 +294,13 @@ class DistributionSales(Base):
         da2 = self.end_date.strftime('%Y, %m, %d')
         date_end = f'ДАТАВРЕМЯ({da2}, 23, 59, 05)'
 
-        sku_codes = DistributionGoods._get_goods_codes_from_db_()
+        r_sku_codes = DistributionGoods.get_db_goods_codes_in_rarus_format()
 
         try:
-            assert len(sku_codes) > 1, 'DistribtuionGoods table is empty ..'
+            assert r_sku_codes, 'Goods db table is empty'
         except AssertionError as err:
-            logging.error(err)
+            logging.error('Goods db table is empty')
             raise err
-
-        r_codes = DistributionGoods.convert_codes_to_rarus_format(sku_codes)
 
         qry_sales = f"""
         ВЫБРАТЬ
@@ -379,7 +329,7 @@ class DistributionSales(Base):
             ПродажиОбороты.Покупатель.Код КАК CustomerCode
 
         ИЗ
-            РегистрНакопления.Продажи.Обороты({date_begin}, {date_end}, День, Номенклатура.Код В ({r_codes})) 
+            РегистрНакопления.Продажи.Обороты({date_begin}, {date_end}, День, Номенклатура.Код В ({r_sku_codes})) 
             КАК ПродажиОбороты
 
         СГРУППИРОВАТЬ ПО
@@ -414,13 +364,12 @@ class DistributionSales(Base):
                                    'cogs', 'margin', 'margin_percent', 'client_code', 'client'])
         df.set_index('code', inplace=True)
         df['log_date'] = datetime.datetime.now()
-
         df_sales = self._set_customers_(df)
 
         return df_sales
 
-    @hybrid_method
-    def _get_customer_(self, x):
+    @staticmethod
+    def _get_customer_(x):
         """
         Продажи в 1С могут идти на покупателей:
             1. Частное лицо (код 0000003) = покупатели из Z-отчетов
@@ -430,17 +379,16 @@ class DistributionSales(Base):
         продала товар дистрибуции.
         Если покупатель не частное лицо и продавцом является ДМ АШАН, то это отдел Б2Б
 
-        :param x:
+        :param x: pd.Series. Строка из pd.Dataframe
         :return:
         """
-        if x['client_code'] == '00000003':
+        if x['client_code'] == '00000003':  # частное лицо
             return x['branch']
         elif x['branch'] == 'ДМ АШАН' and x['client_code'] != '00000003':
             return 'B2B'
         else:
             return x['client']
 
-    @hybrid_method
     def _set_customers_(self, df):
         """
         Установим правильных покупателей
@@ -454,17 +402,14 @@ class DistributionSales(Base):
         logging.info('Finished!')
         return df
 
-    @hybrid_method
     def save_to_db(self, df):
         logging.info('Saving data to database..')
-        db_session = load_session()
-        df.to_sql(self.__tablename__, db_session.connection(), if_exists='append')
+        db_session = create_sql02_connection()
+        df.to_sql(self.DB_TABLE_NAME, db_session.cursor(), if_exists='append')
         db_session.commit()
         db_session.close()
         logging.info('Finished!')
 
-
-Base.prepare()
 
 if __name__ == '__main__':
     DistributionGoods().__call__()
